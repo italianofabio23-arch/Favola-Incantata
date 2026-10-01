@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/story_config.dart';
 import '../services/story_builder.dart';
@@ -27,103 +28,272 @@ class _StoryReaderScreenState extends State<StoryReaderScreen> {
   bool _isSpeaking = false;
   bool _autoContinue = true;
   bool _forward = true;
+  bool _isTurning = false;
+  bool _previewing = false;
+  int _speechVersion = 0;
+  late final Future<void> _ttsSetup;
+  final List<Map<String, String>> _italianVoices = [];
+  Map<String, String>? _selectedVoice;
 
   @override
   void initState() {
     super.initState();
     _pages = StoryBuilder.build(widget.config);
-    _setupTts();
+    _ttsSetup = _setupTts();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _cacheNextImage(0);
+    });
+  }
+
+  // Decodifica in anticipo un'illustrazione alla dimensione del telefono.
+  // Evita picchi di memoria durante l'animazione di cambio pagina.
+  void _cacheNextImage(int current) {
+    final next = current + 1;
+    if (next >= _pages.length) return;
+    final asset = _pages[next].imageAsset;
+    if (asset != null) {
+      precacheImage(ResizeImage(AssetImage(asset), width: 1080), context);
+    }
   }
 
   Future<void> _setupTts() async {
-    await _tts.setLanguage('it-IT');
-    await _tts.setVolume(1.0);
-    await _applyVoiceStyle();
-
     _tts.setStartHandler(() {
-      if (mounted) setState(() => _isSpeaking = true);
+      if (mounted && !_previewing) setState(() => _isSpeaking = true);
     });
 
-    _tts.setCompletionHandler(() async {
+    _tts.setCompletionHandler(() {
       if (!mounted) return;
-      setState(() => _isSpeaking = false);
-      if (_autoContinue && _pageIndex < _pages.length - 1) {
-        await Future<void>.delayed(const Duration(milliseconds: 650));
-        if (!mounted) return;
-        _goToPage(_pageIndex + 1, speakAfterTurn: true);
+      if (_previewing) {
+        _previewing = false;
+        return;
       }
+      // Ignora le notifiche arrivate dopo uno stop o durante il cambio pagina.
+      if (!_isSpeaking || _isTurning) return;
+      final version = _speechVersion;
+      final completedPage = _pageIndex;
+      setState(() => _isSpeaking = false);
+      if (!_autoContinue || completedPage >= _pages.length - 1) return;
+      Future<void>.delayed(const Duration(milliseconds: 400), () {
+        if (!mounted || !_autoContinue || _isTurning ||
+            version != _speechVersion || _pageIndex != completedPage) return;
+        _goToPage(completedPage + 1, speakAfterTurn: true);
+      });
     });
 
-    _tts.setCancelHandler(() {
+    // Lo stato viene gia' gestito dallo stop: un callback di cancel in
+    // ritardo non deve fermare la narrazione della pagina successiva.
+    _tts.setCancelHandler(() {});
+    _tts.setErrorHandler((message) {
+      debugPrint('TTS error: $message');
       if (mounted) setState(() => _isSpeaking = false);
     });
-  }
 
-
-Future<void> _applyVoiceStyle() async {
-  await _tts.setLanguage('it-IT');
-
-  final isNonna = widget.config.voice == 'Nonna';
-
-  await _tts.setSpeechRate(
-    isNonna ? 0.38 : 0.46,
-  );
-  await _tts.setPitch(1.0);
-
-  final availableVoices = await _tts.getVoices;
-
-  if (availableVoices is List) {
-    final italianVoices = availableVoices
-        .where((voice) =>
-            voice is Map &&
-            '${voice['locale']}'.toLowerCase().startsWith('it'))
-        .toList();
-
-    for (final voice in italianVoices) {
-      final name = '${voice['name']}'.toLowerCase();
-
-      if (name.contains('female') ||
-          name.contains('femminile')) {
-        await _tts.setVoice({
-          'name': '${voice['name']}',
-          'locale': '${voice['locale']}',
-        });
-        break;
+    try {
+      await _tts.setLanguage('it-IT');
+      await _tts.setVolume(1.0);
+      final raw = await _tts.getVoices;
+      if (raw is List) {
+        for (final item in raw) {
+          if (item is! Map) continue;
+          final name = '${item['name'] ?? ''}';
+          final locale = '${item['locale'] ?? ''}';
+          if (name.isEmpty ||
+              !locale.toLowerCase().replaceAll('_', '-').startsWith('it')) {
+            continue;
+          }
+          _italianVoices.add({'name': name, 'locale': locale});
+        }
       }
-    }
-  }
-}
 
+      final prefs = await SharedPreferences.getInstance();
+      final prefKey = widget.config.voice.toLowerCase() == 'nonna'
+          ? 'favola_voice_nonna'
+          : 'favola_voice_mamma';
+      final savedName = prefs.getString('${prefKey}_name');
+      final savedLocale = prefs.getString('${prefKey}_locale');
+      for (final voice in _italianVoices) {
+        if (voice['name'] == savedName && voice['locale'] == savedLocale) {
+          _selectedVoice = voice;
+          break;
+        }
+      }
+      if (_selectedVoice == null) {
+        // Android spesso NON dichiara il genere nel nome della voce.
+        final markedFemale = _italianVoices.where((voice) {
+          final name = voice['name']!.toLowerCase();
+          return name.contains('female') || name.contains('femminile');
+        }).toList();
+        if (markedFemale.isNotEmpty) {
+          _selectedVoice = widget.config.voice == 'Nonna' &&
+                  markedFemale.length > 1
+              ? markedFemale[1]
+              : markedFemale.first;
+        }
+      }
+      await _applyVoiceStyle();
+    } catch (error) {
+      debugPrint('TTS setup: $error');
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _applyVoiceStyle() async {
+    final isNonna = widget.config.voice == 'Nonna';
+    await _tts.setSpeechRate(isNonna ? 0.38 : 0.46);
+    await _tts.setPitch(isNonna ? 0.96 : 1.08);
+    if (_selectedVoice != null) await _tts.setVoice(_selectedVoice!);
+  }
+
+  Future<void> _stopReading() async {
+    ++_speechVersion;
+    if (mounted) setState(() => _isSpeaking = false);
+    await _tts.stop();
+  }
 
   Future<void> _speakCurrentPage() async {
-    await _tts.stop();
-    await _applyVoiceStyle();
-    final page = _pages[_pageIndex];
-    await _tts.speak('${page.title}. ${page.text}');
+    if (_isTurning || _previewing) return;
+    final version = ++_speechVersion;
+    await _ttsSetup;
+    if (!mounted || version != _speechVersion) return;
+    try {
+      // Non interrogare l'elenco di tutte le voci a ogni pagina.
+      await _applyVoiceStyle();
+      if (!mounted || version != _speechVersion) return;
+      final page = _pages[_pageIndex];
+      await _tts.speak('${page.title}. ${page.text}');
+    } catch (error) {
+      debugPrint('TTS speak: $error');
+      if (mounted) setState(() => _isSpeaking = false);
+    }
   }
 
   Future<void> _toggleSpeak() async {
     if (_isSpeaking) {
-      await _tts.stop();
-      if (mounted) setState(() => _isSpeaking = false);
+      await _stopReading();
     } else {
       await _speakCurrentPage();
     }
   }
 
   Future<void> _goToPage(int index, {bool speakAfterTurn = false}) async {
-    if (index < 0 || index >= _pages.length) return;
-    await _tts.stop();
-    if (!mounted) return;
+    if (_isTurning || !mounted || index < 0 ||
+        index >= _pages.length || index == _pageIndex) return;
+    _isTurning = true;
+    final version = ++_speechVersion;
+    final needsStop = _isSpeaking || _previewing;
+    _previewing = false;
+    setState(() => _isSpeaking = false);
+    // Dopo il completamento naturale non serve fermare di nuovo il motore.
+    if (needsStop) await _tts.stop();
+    if (!mounted || version != _speechVersion) {
+      _isTurning = false;
+      return;
+    }
     setState(() {
       _forward = index > _pageIndex;
       _pageIndex = index;
-      _isSpeaking = false;
     });
-    if (speakAfterTurn) {
-      await Future<void>.delayed(const Duration(milliseconds: 900));
-      if (mounted) await _speakCurrentPage();
+    _cacheNextImage(index);
+    await Future<void>.delayed(const Duration(milliseconds: 680));
+    _isTurning = false;
+    if (mounted && version == _speechVersion && speakAfterTurn) {
+      await _speakCurrentPage();
     }
+  }
+
+  Future<void> _previewVoice(Map<String, String> voice) async {
+    await _stopReading();
+    _previewing = true;
+    try {
+      await _tts.setLanguage('it-IT');
+      await _tts.setVoice(voice);
+      await _tts.setSpeechRate(widget.config.voice == 'Nonna' ? 0.38 : 0.46);
+      await _tts.speak('Ciao, sono la voce della tua favola magica.');
+    } catch (error) {
+      _previewing = false;
+      debugPrint('Voice preview: $error');
+    }
+  }
+
+  Future<void> _chooseNarratorVoice() async {
+    await _ttsSetup;
+    if (!mounted) return;
+    if (_italianVoices.isEmpty) {
+      showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Nessuna voce italiana trovata'),
+          content: const Text(
+            'Installa o aggiorna Servizi vocali di Google nelle '
+            'impostazioni del telefono e scarica una voce italiana.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    await _stopReading();
+    final choice = await showModalBottomSheet<Map<String, String>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.of(sheetContext).size.height * 0.60,
+          child: Column(
+            children: [
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  'Scegli una voce italiana: ascolta le anteprime '
+                  'e seleziona quella che preferisci.',
+                  style: TextStyle(fontSize: 16),
+                ),
+              ),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: _italianVoices.length,
+                  itemBuilder: (context, index) {
+                    final voice = _italianVoices[index];
+                    return ListTile(
+                      title: Text('Voce ${index + 1}'),
+                      subtitle: Text(voice['name'] ?? ''),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.volume_up_rounded),
+                        tooltip: 'Ascolta',
+                        onPressed: () => _previewVoice(voice),
+                      ),
+                      onTap: () => Navigator.pop(sheetContext, voice),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    _previewing = false;
+    await _tts.stop();
+    if (!mounted) return;
+    if (choice != null) {
+      setState(() => _selectedVoice = choice);
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final prefKey = widget.config.voice.toLowerCase() == 'nonna'
+            ? 'favola_voice_nonna'
+            : 'favola_voice_mamma';
+        await prefs.setString('${prefKey}_name', choice['name']!);
+        await prefs.setString('${prefKey}_locale', choice['locale']!);
+      } catch (error) {
+        debugPrint('Saving narrator voice: $error');
+      }
+    }
+    await _applyVoiceStyle();
   }
 
   @override
@@ -166,12 +336,12 @@ Future<void> _applyVoiceStyle() async {
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
                 child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 850),
+                  duration: const Duration(milliseconds: 650),
                   switchInCurve: Curves.easeOutCubic,
                   switchOutCurve: Curves.easeInCubic,
                   transitionBuilder: (child, animation) {
                     final rotate = Tween<double>(
-                      begin: _forward ? math.pi / 2.6 : -math.pi / 2.6,
+                      begin: _forward ? math.pi / 5 : -math.pi / 5,
                       end: 0,
                     ).animate(animation);
                     return AnimatedBuilder(
@@ -218,7 +388,7 @@ Future<void> _applyVoiceStyle() async {
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       IconButton.filledTonal(
-                        onPressed: _pageIndex == 0 ? null : () => _goToPage(_pageIndex - 1),
+                        onPressed: _pageIndex == 0 ? null : () => _goToPage(_pageIndex - 1, speakAfterTurn: _isSpeaking),
                         icon: const Icon(Icons.skip_previous_rounded),
                       ),
                       const SizedBox(width: 18),
@@ -238,7 +408,7 @@ Future<void> _applyVoiceStyle() async {
                       ),
                       const SizedBox(width: 18),
                       IconButton.filledTonal(
-                        onPressed: _pageIndex == _pages.length - 1 ? null : () => _goToPage(_pageIndex + 1),
+                        onPressed: _pageIndex == _pages.length - 1 ? null : () => _goToPage(_pageIndex + 1, speakAfterTurn: _isSpeaking),
                         icon: const Icon(Icons.skip_next_rounded),
                       ),
                     ],
@@ -247,7 +417,14 @@ Future<void> _applyVoiceStyle() async {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text('🎙️ ${widget.config.voice}', style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                      TextButton.icon(
+                        onPressed: _chooseNarratorVoice,
+                        icon: const Icon(Icons.record_voice_over_rounded,
+                            color: Color(0xFFFFD56B), size: 18),
+                        label: Text('${widget.config.voice}: scegli voce',
+                            style: const TextStyle(fontSize: 11,
+                                color: Colors.white70)),
+                      ),
                       Row(
                         children: [
                           const Text('Auto pagina', style: TextStyle(fontSize: 12, color: Colors.white70)),
@@ -330,14 +507,15 @@ class _SceneIllustration extends StatelessWidget {
         bottomLeft: Radius.circular(24),
         topRight: Radius.circular(24),
       ),
-
       child: Image.asset(
         page.imageAsset!,
         fit: BoxFit.cover,
         width: double.infinity,
         height: double.infinity,
+        cacheWidth: 1080,
+        filterQuality: FilterQuality.low,
+        gaplessPlayback: true,
       ),
-
     );
   }
 }
