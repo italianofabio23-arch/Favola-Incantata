@@ -1,0 +1,10 @@
+.dart_tool/
+build/
+.pub-cache/
+.flutter-plugins*
+android/local.properties
+android/key.properties
+*.jks
+*.keystore
+.env
+**/.trashed-*
