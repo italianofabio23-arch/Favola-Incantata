@@ -59,15 +59,41 @@ class _StoryReaderScreenState extends State<StoryReaderScreen> {
     });
   }
 
-  Future<void> _applyVoiceStyle() async {
-    if (widget.config.voice == 'Nonna') {
-      await _tts.setSpeechRate(.38);
-      await _tts.setPitch(.88);
-    } else {
-      await _tts.setSpeechRate(.44);
-      await _tts.setPitch(1.03);
+
+Future<void> _applyVoiceStyle() async {
+  await _tts.setLanguage('it-IT');
+
+  final isNonna = widget.config.voice == 'Nonna';
+
+  await _tts.setSpeechRate(
+    isNonna ? 0.38 : 0.46,
+  );
+  await _tts.setPitch(1.0);
+
+  final availableVoices = await _tts.getVoices;
+
+  if (availableVoices is List) {
+    final italianVoices = availableVoices
+        .where((voice) =>
+            voice is Map &&
+            '${voice['locale']}'.toLowerCase().startsWith('it'))
+        .toList();
+
+    for (final voice in italianVoices) {
+      final name = '${voice['name']}'.toLowerCase();
+
+      if (name.contains('female') ||
+          name.contains('femminile')) {
+        await _tts.setVoice({
+          'name': '${voice['name']}',
+          'locale': '${voice['locale']}',
+        });
+        break;
+      }
     }
   }
+}
+
 
   Future<void> _speakCurrentPage() async {
     await _tts.stop();
@@ -304,52 +330,14 @@ class _SceneIllustration extends StatelessWidget {
         bottomLeft: Radius.circular(24),
         topRight: Radius.circular(24),
       ),
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          const DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Color(0xFF1B5798), Color(0xFF113861), Color(0xFF153F2C)],
-              ),
-            ),
-          ),
-          Positioned.fill(
-  child: Image.asset(
-    page.imageAsset!,
-    fit: BoxFit.cover,
-  ),
-),
-          const Positioned(top: 22, left: 26, child: Text('✨', style: TextStyle(fontSize: 28))),
-          const Positioned(top: 55, right: 30, child: Text('⭐', style: TextStyle(fontSize: 20))),
-          const Positioned(bottom: 20, left: 28, child: Text('🌿', style: TextStyle(fontSize: 62))),
-          const Positioned(bottom: 24, right: 26, child: Text('🌲', style: TextStyle(fontSize: 78))),
-          Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(page.emoji, style: const TextStyle(fontSize: 96)),
-                const SizedBox(height: 14),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: .28),
-                    borderRadius: BorderRadius.circular(99),
-                    border: Border.all(color: Colors.white24),
-                  ),
-                  child: Text(
-                    page.sceneLabel,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(fontWeight: FontWeight.w800, color: Colors.white),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
+
+      child: Image.asset(
+        page.imageAsset!,
+        fit: BoxFit.cover,
+        width: double.infinity,
+        height: double.infinity,
       ),
+
     );
   }
 }
