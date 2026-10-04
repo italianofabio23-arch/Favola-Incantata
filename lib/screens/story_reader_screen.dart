@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:page_flip/page_flip.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -22,6 +23,9 @@ class StoryReaderScreen extends StatefulWidget {
 
 class _StoryReaderScreenState extends State<StoryReaderScreen> {
   final FlutterTts _tts = FlutterTts();
+  final GlobalKey<PageFlipWidgetState> _flipKey = GlobalKey<PageFlipWidgetState>();
+  bool _resumeAfterFlip = false;
+  Future<dynamic>? _flipStopFuture;
   late final List<StoryPageData> _pages;
 
   int _pageIndex = 0;
@@ -177,27 +181,37 @@ class _StoryReaderScreenState extends State<StoryReaderScreen> {
 
   Future<void> _goToPage(int index, {bool speakAfterTurn = false}) async {
     if (_isTurning || !mounted || index < 0 ||
-        index >= _pages.length || index == _pageIndex) return;
+        index >= _pages.length ||
+        (index - _pageIndex).abs() != 1) return;
+
+    final flip = _flipKey.currentState;
+    if (flip == null) return;
+
     _isTurning = true;
+    _resumeAfterFlip = speakAfterTurn;
     final version = ++_speechVersion;
     final needsStop = _isSpeaking || _previewing;
     _previewing = false;
     setState(() => _isSpeaking = false);
-    // Dopo il completamento naturale non serve fermare di nuovo il motore.
+
     if (needsStop) await _tts.stop();
+
     if (!mounted || version != _speechVersion) {
       _isTurning = false;
+      _resumeAfterFlip = false;
       return;
     }
-    setState(() {
-      _forward = index > _pageIndex;
-      _pageIndex = index;
-    });
-    _cacheNextImage(index);
-    await Future<void>.delayed(const Duration(milliseconds: 680));
-    _isTurning = false;
-    if (mounted && version == _speechVersion && speakAfterTurn) {
-      await _speakCurrentPage();
+
+    try {
+      if (index > _pageIndex) {
+        await flip.nextPage();
+      } else {
+        await flip.previousPage();
+      }
+    } catch (error) {
+      debugPrint("Errore sfoglio: $error");
+      _isTurning = false;
+      _resumeAfterFlip = false;
     }
   }
 
@@ -335,35 +349,40 @@ class _StoryReaderScreenState extends State<StoryReaderScreen> {
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 650),
-                  switchInCurve: Curves.easeOutCubic,
-                  switchOutCurve: Curves.easeInCubic,
-                  transitionBuilder: (child, animation) {
-                    final rotate = Tween<double>(
-                      begin: _forward ? math.pi / 5 : -math.pi / 5,
-                      end: 0,
-                    ).animate(animation);
-                    return AnimatedBuilder(
-                      animation: rotate,
-                      child: child,
-                      builder: (context, child) {
-                        return Transform(
-                          alignment: _forward ? Alignment.centerLeft : Alignment.centerRight,
-                          transform: Matrix4.identity()
-                            ..setEntry(3, 2, 0.0015)
-                            ..rotateY(rotate.value),
-                          child: child,
-                        );
-                      },
-                    );
+                child: PageFlipWidget(
+                  key: _flipKey,
+                  onFlipStart: () {
+                    if (_isTurning) return;
+                    _isTurning = true;
+                    _resumeAfterFlip = _isSpeaking;
+                    ++_speechVersion;
+                    _previewing = false;
+                    setState(() => _isSpeaking = false);
+                    _flipStopFuture = _tts.stop();
                   },
-                  child: _OpenBook(
-                    key: ValueKey(_pageIndex),
-                    page: page,
-                    pageNumber: _pageIndex + 1,
-                    totalPages: _pages.length,
-                  ),
+                  onPageFlipped: (index) async {
+                    if (!mounted) return;
+                    setState(() => _pageIndex = index);
+                    _cacheNextImage(index);
+                    final pending = _flipStopFuture;
+                    _flipStopFuture = null;
+                    if (pending != null) await pending;
+                    final resume = _resumeAfterFlip;
+                    _resumeAfterFlip = false;
+                    _isTurning = false;
+                    if (mounted && resume) await _speakCurrentPage();
+                  },
+                  duration: const Duration(milliseconds: 780),
+                  backgroundColor: const Color(0xFFF8EFD8),
+                  children: [
+                    for (int i = 0; i < _pages.length; i++)
+                      _OpenBook(
+                        key: ValueKey(i),
+                        page: _pages[i],
+                        pageNumber: i + 1,
+                        totalPages: _pages.length,
+                      ),
+                  ],
                 ),
               ),
             ),
